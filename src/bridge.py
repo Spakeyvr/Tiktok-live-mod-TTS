@@ -91,6 +91,7 @@ class TikTokBridge:
                     log.info("bridge ready (room=%s)", event.get("roomId"))
                     self._ready.set()
                 elif etype == "chat":
+                    follow_role = int(event.get("followRole", 0))
                     msg = ChatMessage(
                         id=event.get("id", ""),
                         user_id=event.get("userId", ""),
@@ -98,7 +99,7 @@ class TikTokBridge:
                         nickname=event.get("nickname", ""),
                         comment=event.get("comment", ""),
                         ts_ms=int(event.get("ts", 0)),
-                        is_follower=int(event.get("followRole", 0)) >= 1,
+                        is_follower=follow_role >= 1,
                     )
                     await self._messages.put(msg)
                 elif etype == "ack":

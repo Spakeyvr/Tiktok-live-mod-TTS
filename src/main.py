@@ -5,7 +5,15 @@ import asyncio
 import logging
 import signal
 import sys
+import warnings
 from pathlib import Path
+
+# Suppress PyTorch's FutureWarning about the deprecated weight_norm API used
+# internally by Kokoro — we can't fix third-party model code.
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+# Suppress HuggingFace Hub's unauthenticated-request UserWarning.
+warnings.filterwarnings("ignore", message=".*unauthenticated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*HF_TOKEN.*", category=UserWarning)
 
 from .audio import AudioPlayer
 from .bridge import TikTokBridge
@@ -22,10 +30,20 @@ log = logging.getLogger("tiktok-tts-mod")
 
 
 def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+    # Root logger at WARNING so third-party libraries that log to the root
+    # (RealtimeTTS, NLTK, httpx) don't flood the console.
+    logging.basicConfig(level=logging.WARNING, format=fmt)
+
+    # Our own loggers at the user-configured level.
+    for name in ("tiktok-tts-mod", "src"):
+        logging.getLogger(name).setLevel(lvl)
+
+    # Silence chatty third-party loggers that aren't useful at runtime.
+    for noisy in ("httpx", "huggingface_hub", "huggingface_hub.utils._http"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
 
 
 async def _amain(cfg_path: Path) -> int:
