@@ -79,6 +79,7 @@ async def _amain(cfg_path: Path) -> int:
         player=player,
         event_log=event_log,
         moderation_enabled=cfg.moderation.enabled,
+        followers_only=cfg.tts.followers_only,
     )
 
     stop = asyncio.Event()

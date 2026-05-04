@@ -35,6 +35,7 @@ class Pipeline:
         event_log: EventLog,
         max_concurrency: int = 2,
         moderation_enabled: bool = True,
+        followers_only: bool = False,
     ) -> None:
         self.bridge = bridge
         self.normalizer = normalizer
@@ -45,6 +46,7 @@ class Pipeline:
         self.player = player
         self.event_log = event_log
         self.moderation_enabled = moderation_enabled
+        self.followers_only = followers_only
         self._sem = asyncio.Semaphore(max_concurrency)
         self._tasks: set[asyncio.Task] = set()
 
@@ -66,6 +68,10 @@ class Pipeline:
                 log.exception("pipeline crashed on msg %s", msg.id)
 
     async def _process(self, msg: ChatMessage) -> None:
+        if self.followers_only and not msg.is_follower:
+            log.debug("skip non-follower %s", msg.unique_id)
+            return
+
         normalized = self.normalizer.normalize(msg.comment)
         if not normalized:
             log.debug("skip empty after normalize: %s", msg.id)

@@ -20,6 +20,7 @@ class TTSCfg:
     voice: str = "af_sarah"
     piper_model: str = ""
     sample_rate: int = 24000
+    followers_only: bool = False
 
 
 @dataclass

@@ -19,6 +19,7 @@ class ChatMessage:
     nickname: str
     comment: str
     ts_ms: int
+    is_follower: bool = False
 
 
 class TikTokBridge:
@@ -97,6 +98,7 @@ class TikTokBridge:
                         nickname=event.get("nickname", ""),
                         comment=event.get("comment", ""),
                         ts_ms=int(event.get("ts", 0)),
+                        is_follower=int(event.get("followRole", 0)) >= 1,
                     )
                     await self._messages.put(msg)
                 elif etype == "ack":
