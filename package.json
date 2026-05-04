@@ -1,0 +1,16 @@
+{
+  "name": "tiktok-tts-mod-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js bridge between TikTok-Live-Connector and the Python moderation pipeline.",
+  "main": "bridge/tiktok_bridge.js",
+  "scripts": {
+    "start": "node bridge/tiktok_bridge.js"
+  },
+  "dependencies": {
+    "tiktok-live-connector": "^2.0.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,9 @@
+PyYAML>=6.0
+confusables>=1.2.0
+RealtimeTTS[kokoro,piper]>=0.4.50
+faster-whisper>=1.0.3
+openai>=1.40.0
+sounddevice>=0.4.7
+numpy>=1.26
+soundfile>=0.12.1
+aiofiles>=23.2
