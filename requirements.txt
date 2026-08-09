@@ -1,9 +1,17 @@
 PyYAML>=6.0
 confusables>=1.2.0
-RealtimeTTS[kokoro,piper]>=0.4.50
-faster-whisper>=1.0.3
-openai>=1.40.0
+mlx-audio[tts]==0.4.5
+misaki[en]==0.9.4
+spacy>=3.8,<3.9
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+phonemizer-fork>=3.3.2,<4
+espeakng-loader==0.2.4
+torch==2.12.1
+torchvision==0.27.1
+transformers>=5.7.0,<6
+peft>=0.20.0,<1
+accelerate>=1.14.0,<2
 sounddevice>=0.4.7
 numpy>=1.26
-soundfile>=0.12.1
 aiofiles>=23.2
+Pillow>=11.0.0

@@ -34,8 +34,8 @@ class TikTokModerator:
             elif punishment == "block":
                 await self.bridge.block(user_id)
             else:
-                log.warning("unknown punishment %r; defaulting to mute", punishment)
-                await self.bridge.mute(user_id, self.mute_duration_seconds)
+                log.error("refusing unknown punishment %r", punishment)
+                return False
             return True
         except Exception as e:
             log.error("moderation dispatch failed: %s", e)

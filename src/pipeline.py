@@ -6,10 +6,9 @@ import logging
 from .audio import AudioPlayer
 from .bridge import ChatMessage, TikTokBridge
 from .db import EventLog
-from .llm_filter import LLMFilter
+from .llm_filter import AudioFilter
 from .moderator import Moderator
 from .normalizer import Normalizer
-from .stt import STTEngine
 from .tts import TTSEngine
 
 log = logging.getLogger(__name__)
@@ -17,7 +16,7 @@ log = logging.getLogger(__name__)
 
 class Pipeline:
     """Per-message pipeline:
-        normalize -> TTS (buffer) -> STT -> LLM filter -> moderate / play.
+        normalize -> TTS (buffer) -> Gemma 4 audio filter -> moderate / play.
 
     Messages are processed concurrently up to `max_concurrency`. Audio
     playback is serialized inside AudioPlayer so safe clips don't overlap.
@@ -28,8 +27,7 @@ class Pipeline:
         bridge: TikTokBridge,
         normalizer: Normalizer,
         tts: TTSEngine,
-        stt: STTEngine | None,
-        llm: LLMFilter | None,
+        llm: AudioFilter | None,
         moderator: Moderator | None,
         player: AudioPlayer,
         event_log: EventLog,
@@ -40,7 +38,6 @@ class Pipeline:
         self.bridge = bridge
         self.normalizer = normalizer
         self.tts = tts
-        self.stt = stt
         self.llm = llm
         self.moderator = moderator
         self.player = player
@@ -92,7 +89,6 @@ class Pipeline:
                 nickname=msg.nickname,
                 raw_comment=msg.comment,
                 normalized=normalized,
-                transcript="",
                 safe=True,
                 punishment=None,
                 reason="moderation disabled",
@@ -102,11 +98,8 @@ class Pipeline:
             await self.player.play(pcm, sample_rate)
             return
 
-        assert self.stt is not None and self.llm is not None
-        transcript = await self.stt.transcribe(pcm, sample_rate)
-        log.info("[%s] transcript: %r", msg.id, transcript)
-
-        decision = await self.llm.check(transcript)
+        assert self.llm is not None and self.moderator is not None
+        decision = await self.llm.check_audio(pcm, sample_rate)
         log.info(
             "[%s] decision safe=%s punishment=%s reason=%s",
             msg.id,
@@ -116,10 +109,8 @@ class Pipeline:
         )
 
         action_ok: bool | None = None
-        if not decision.safe and decision.punishment != "skip":
-            action_ok = await self.moderator.punish(
-                msg.user_id, decision.punishment or "mute"
-            )
+        if not decision.safe:
+            action_ok = await self.moderator.punish(msg.user_id, "block")
 
         await self.event_log.log(
             msg_id=msg.id,
@@ -128,7 +119,6 @@ class Pipeline:
             nickname=msg.nickname,
             raw_comment=msg.comment,
             normalized=normalized,
-            transcript=transcript,
             safe=decision.safe,
             punishment=decision.punishment,
             reason=decision.reason,
@@ -138,4 +128,4 @@ class Pipeline:
 
         if decision.safe:
             await self.player.play(pcm, sample_rate)
-        # skip/mute/block: drop audio, no playback.
+        # blocked audio is dropped; safe audio is played.

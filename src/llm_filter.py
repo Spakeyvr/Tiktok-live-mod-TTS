@@ -1,180 +1,240 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Iterable, Literal, Protocol
+from pathlib import Path
+from typing import Any, Protocol
 
-from openai import AsyncOpenAI
+import numpy as np
 
 log = logging.getLogger(__name__)
 
 
-Punishment = Literal["mute", "block", "skip"]
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass
 class FilterDecision:
     safe: bool
-    punishment: Punishment | None  # None when safe
-    reason: str = ""             # local diagnostic; not sent to TikTok
-    raw: str = ""                # raw model output
+    punishment: str | None
+    reason: str = ""
+    raw: str = ""
 
 
-SYSTEM_PROMPT = """You are a strict real-time content safety filter for a live-streaming chat-to-TTS pipeline.
+POLICY_PROMPT = """Listen to the following TTS audio and classify it under this exact policy.
 
-You receive a transcript of what a TTS engine *actually said out loud* after reading a viewer's chat message. The viewer may have used homoglyphs, leetspeak, spacing tricks, or phonetic spellings to bypass filters; the TTS+STT round-trip exposes the spoken form.
+Block only:
+1. A clear claim, request, or offer to possess, access, obtain, trade, sell, send, or share child sexual abuse material (CSAM), or an unambiguous equivalent.
+2. Clear racism: racial or ethnic slurs, racist abuse/dehumanization/exclusion, or a deliberate spoken near-slur meant to sound racist. Judge sound rather than spelling; for example, an intentional N-word-like pronunciation such as "Meggar" is racist evasion.
 
-Decide whether the spoken transcript contains any of:
-- slurs targeting protected characteristics (race, ethnicity, religion, gender, sexuality, disability)
-- hate speech, dehumanization, or incitement
-- explicit attempts to bypass moderation (e.g. coded slurs)
-- explicit threats of doxxing
-- similar words to slurs which carry over a bad meaning
-- content that resembles the above in a way that suggests the user is trying to be harmful, even if the exact words aren't on a blocklist
-- spam meant to be annoying or disruptive (e.g. repeated characters, long strings of nonsense, etc.)
+Everything else is safe, including profanity, insults, harassment, spam, threats, doxxing, self-harm language, illegal activity, adult sexual language, non-racial identity hostility, and borderline cases. Neutral reporting, condemnation, education, or discussion of CSAM or racism is safe unless the speaker actually makes a prohibited claim/request/offer or uses racist audio as abuse or bait.
 
-Severity — choose the lowest level that fits:
-- "skip"  — drop the TTS audio silently, no action taken against the user. Use for borderline/crude content that shouldn't be read aloud but doesn't warrant punishment (e.g. spam)
-- "mute"  — silence the user for 5 minutes. Use for clear slurs, harassment, hate speech.
-- "block" — permanent mute. Use only for explicit threats of violence, doxxing, or severe escalation.
-
-Do not punish:
-- non-harmful content (e.g. casual profanity, inoffensive reclaimed slurs, non-hateful uses of hateful words)
-- others critizing or making fun of hateful content (e.g. "I hate [slur]", "X is a [slur]", "so many people saying slurs")
-
-To decide punishment:
-- "safe": true means the message is clean and gets sent.
-- "safe": false means the message is not clean and gets declined.
-- "punishment": "skip" means the message is not clean but not too severe, so it gets declined but no punishment.
-- "punishment": "mute" means the user should be muted for 5 minutes.
-- "punishment": "block" means the user should be permanently blocked.
-
-Output STRICTLY a single JSON object on one line, no prose, no markdown, no code fences:
-{"safe": true} when clean.
-{"safe": false, "punishment": "mute"} or {"safe": false, "punishment": "block"} or {"safe": false, "punishment": "skip"} when not.
-
-Do not include any other keys. Do not explain. Do not apologize. JSON only. /no_think"""
+Return only {"safe": true} or {"safe": false, "punishment": "block"}. No explanation."""
 
 
-class LLMFilter(Protocol):
-    async def check(self, transcript: str) -> FilterDecision: ...
+class AudioFilter(Protocol):
+    async def check_audio(self, pcm: np.ndarray, sample_rate: int) -> FilterDecision: ...
 
 
-class OpenAICompatibleFilter:
-    """Works with any OpenAI-compatible endpoint (Ollama, LM Studio, oMLX, ...).
+_JSON_OBJECT = re.compile(r"\{.*?\}", re.DOTALL)
 
-    For Qwen3.5 on Ollama, pass think=False so the model skips its reasoning
-    phase entirely. The parameter goes as a top-level body key via extra_body;
-    it is silently ignored by backends that don't understand it.
-    """
+
+def parse_decision(raw: str) -> FilterDecision:
+    """Accept only the exact block schema. Any uncertainty fails open."""
+    match = _JSON_OBJECT.search(raw)
+    if not match:
+        return FilterDecision(True, None, "unparseable response; allowed", raw)
+    try:
+        value = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return FilterDecision(True, None, "invalid JSON; allowed", raw)
+    if value == {"safe": False, "punishment": "block"}:
+        return FilterDecision(False, "block", raw=raw)
+    if value == {"safe": True}:
+        return FilterDecision(True, None, raw=raw)
+    return FilterDecision(True, None, "unexpected schema; allowed", raw)
+
+
+def resample_mono(pcm: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    audio = np.asarray(pcm, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=-1)
+    audio = audio.reshape(-1)
+    if source_rate <= 0 or target_rate <= 0:
+        raise ValueError("sample rates must be positive")
+    if audio.size == 0 or source_rate == target_rate:
+        return audio
+    target_size = max(1, round(audio.size * target_rate / source_rate))
+    source_points = np.linspace(0.0, 1.0, num=audio.size, endpoint=False)
+    target_points = np.linspace(0.0, 1.0, num=target_size, endpoint=False)
+    return np.interp(target_points, source_points, audio).astype(np.float32)
+
+
+class Gemma4AudioFilter:
+    """Local Gemma 4 E4B classifier that consumes the synthesized PCM directly."""
 
     def __init__(
         self,
-        base_url: str,
-        api_key: str,
-        model: str,
-        temperature: float = 0.0,
-        request_timeout: int = 30,
-        local_blocklist: Iterable[str] = (),
-        think: bool = False,
+        *,
+        model: str = "google/gemma-4-E4B-it",
+        adapter_path: str = "",
+        revision: str | None = None,
+        device: str = "auto",
+        max_new_tokens: int = 32,
     ) -> None:
-        self.model = model
-        self.temperature = temperature
-        self.think = think
-        self.client = AsyncOpenAI(
-            base_url=base_url, api_key=api_key or "not-needed", timeout=request_timeout
-        )
-        self.local_blocklist = [b.lower() for b in local_blocklist if b]
+        self.model_name = model
+        self.adapter_path = Path(adapter_path).expanduser() if adapter_path else None
+        self.revision = revision or None
+        self.requested_device = device
+        self.max_new_tokens = max_new_tokens
+        self._processor: Any = None
+        self._model: Any = None
+        self._torch: Any = None
+        self._device = "cpu"
+        self._load_lock = asyncio.Lock()
+        self._inference_lock = asyncio.Lock()
+        self._load_error: Exception | None = None
+        self._manifest: dict[str, Any] | None = None
 
-    async def check(self, transcript: str) -> FilterDecision:
-        if not transcript.strip():
-            return FilterDecision(safe=True, punishment=None, reason="empty transcript")
+    def validate_configuration(self) -> None:
+        if self.adapter_path is None:
+            raise ValueError("a trained Gemma 4 direct-audio adapter is required")
+        adapter = self.adapter_path.resolve()
+        if not (adapter / "adapter_config.json").is_file():
+            raise FileNotFoundError(f"missing Gemma 4 adapter: {adapter}")
+        manifest_path = adapter / "training_manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError(f"missing adapter provenance manifest: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("architecture") != "gemma-4-direct-audio-lora":
+            raise ValueError(f"adapter is not a Gemma 4 direct-audio adapter: {adapter}")
+        if manifest.get("model") != self.model_name:
+            raise ValueError(
+                f"adapter base model is {manifest.get('model')!r}, not {self.model_name!r}"
+            )
+        adapter_weights = adapter / "adapter_model.safetensors"
+        if not adapter_weights.is_file():
+            raise FileNotFoundError(f"missing adapter weights: {adapter_weights}")
+        if manifest.get("adapter_sha256") != sha256_file(adapter_weights):
+            raise ValueError(f"adapter weights do not match their provenance manifest: {adapter}")
+        policy_hash = hashlib.sha256(POLICY_PROMPT.encode("utf-8")).hexdigest()
+        if manifest.get("policy_sha256") != policy_hash:
+            raise ValueError(f"runtime policy does not match the adapter's training policy: {adapter}")
+        trained_revision = manifest.get("revision")
+        if self.revision and trained_revision and self.revision != trained_revision:
+            raise ValueError(
+                f"adapter base revision is {trained_revision!r}, not {self.revision!r}"
+            )
+        self._manifest = manifest
 
-        lowered = transcript.lower()
-        for term in self.local_blocklist:
-            if term in lowered:
-                return FilterDecision(
-                    safe=False,
-                    punishment="mute",
-                    reason=f"local blocklist match: {term!r}",
-                )
+    async def load(self) -> None:
+        if self._model is not None:
+            return
+        if self._load_error is not None:
+            raise self._load_error
+        async with self._load_lock:
+            if self._model is None:
+                try:
+                    await asyncio.to_thread(self._load_blocking)
+                except Exception as exc:
+                    self._load_error = exc
+                    raise
 
+    def _load_blocking(self) -> None:
+        self.validate_configuration()
+        assert self._manifest is not None
+        effective_revision = self.revision or self._manifest.get("revision")
         try:
-            resp = await self.client.chat.completions.create(
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=50,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Transcript: {transcript}"},
-                    {"role": "assistant", "content": "{"},
+            import torch
+            from transformers import AutoModelForMultimodalLM, AutoProcessor
+        except ImportError as exc:
+            raise RuntimeError("install the Gemma 4 runtime requirements") from exc
+
+        if self.requested_device == "auto":
+            device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            device = self.requested_device
+        if device == "mps":
+            dtype = torch.bfloat16 if torch.backends.mps.is_macos_or_newer(14, 0) else torch.float16
+        elif device == "cuda":
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            dtype = torch.float32
+
+        processor = AutoProcessor.from_pretrained(self.model_name, revision=effective_revision)
+        model = AutoModelForMultimodalLM.from_pretrained(
+            self.model_name,
+            revision=effective_revision,
+            dtype=dtype,
+            attn_implementation="eager" if device == "mps" else None,
+        )
+        if self.adapter_path:
+            adapter = self.adapter_path.resolve()
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(model, adapter)
+        model.to(device).eval()
+        self._torch = torch
+        self._processor = processor
+        self._model = model
+        self._device = device
+        log.info("loaded %s on %s", self.model_name, device)
+
+    async def check_audio(self, pcm: np.ndarray, sample_rate: int) -> FilterDecision:
+        if np.asarray(pcm).size == 0:
+            return FilterDecision(True, None, "empty audio")
+        try:
+            await self.load()
+            async with self._inference_lock:
+                return await asyncio.to_thread(self._check_blocking, pcm, sample_rate)
+        except Exception as exc:
+            log.warning("Gemma 4 audio classification failed (%s); allowing audio.", exc)
+            return FilterDecision(True, None, f"model_error: {exc}")
+
+    def _check_blocking(self, pcm: np.ndarray, sample_rate: int) -> FilterDecision:
+        processor = self._processor
+        torch = self._torch
+        target_rate = int(processor.feature_extractor.sampling_rate)
+        audio = resample_mono(pcm, sample_rate, target_rate)
+        duration = audio.size / target_rate
+        if duration > 30.0:
+            raise ValueError(f"audio exceeds Gemma 4's 30-second limit ({duration:.2f}s)")
+
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": POLICY_PROMPT},
+                    {"type": "audio"},
                 ],
-                extra_body={"think": self.think},
-            )
-        except Exception as e:
-            log.warning("LLM call failed (%s); failing closed with mute.", e)
-            return FilterDecision(
-                safe=False, punishment="mute", reason=f"llm_error: {e}"
-            )
-
-        raw = _strip_think_tags(resp.choices[0].message.content or "").strip()
-        # Restore the prefilled "{" if the model didn't repeat it.
-        if raw and not raw.startswith("{"):
-            raw = "{" + raw
-        decision = _parse_decision(raw)
-        decision.raw = raw
-        return decision
-
-
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_THINK_OPEN_RE = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
-_JSON_RE = re.compile(r"\{.*?\}", re.DOTALL)
-
-
-def _strip_think_tags(text: str) -> str:
-    """Remove <think>…</think> blocks that Qwen3.5 may emit even with think=false.
-
-    Also strips an unterminated <think> tag to end-of-string, which happens
-    when max_tokens cuts off the model mid-reasoning.
-    """
-    text = _THINK_RE.sub("", text)
-    return _THINK_OPEN_RE.sub("", text)
-
-
-def _parse_decision(raw: str) -> FilterDecision:
-    if not raw:
-        return FilterDecision(
-            safe=False, punishment="mute", reason="empty llm response"
+            }
+        ]
+        prompt = processor.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=False
         )
-    text = raw.strip()
-    # Tolerate fenced output even though we asked for none.
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-        text = text.strip()
-    try:
-        obj = json.loads(text)
-    except json.JSONDecodeError:
-        match = _JSON_RE.search(text)
-        if not match:
-            return FilterDecision(
-                safe=False, punishment="mute", reason=f"unparseable: {raw!r}"
+        inputs = processor(
+            text=prompt,
+            audio=audio,
+            sampling_rate=target_rate,
+            return_tensors="pt",
+            return_mm_token_type_ids=True,
+        ).to(self._device)
+        prompt_length = inputs["input_ids"].shape[1]
+        with torch.inference_mode():
+            generated = self._model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                use_cache=True,
             )
-        try:
-            obj = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return FilterDecision(
-                safe=False, punishment="mute", reason=f"unparseable: {raw!r}"
-            )
-
-    safe = bool(obj.get("safe"))
-    if safe:
-        return FilterDecision(safe=True, punishment=None)
-    punishment = obj.get("punishment")
-    if punishment not in ("mute", "block", "skip"):
-        punishment = "mute"
-    return FilterDecision(safe=False, punishment=punishment)
+        raw = processor.decode(generated[0, prompt_length:], skip_special_tokens=True).strip()
+        return parse_decision(raw)

@@ -19,7 +19,6 @@ CREATE TABLE IF NOT EXISTS events (
     nickname        TEXT,
     raw_comment     TEXT,
     normalized      TEXT,
-    transcript      TEXT,
     safe            INTEGER NOT NULL,
     punishment      TEXT,
     reason          TEXT,
@@ -54,7 +53,6 @@ class EventLog:
         nickname: str,
         raw_comment: str,
         normalized: str,
-        transcript: str,
         safe: bool,
         punishment: str | None,
         reason: str,
@@ -70,7 +68,6 @@ class EventLog:
                 nickname,
                 raw_comment,
                 normalized,
-                transcript,
                 safe,
                 punishment,
                 reason,
@@ -87,7 +84,6 @@ class EventLog:
             nickname,
             raw_comment,
             normalized,
-            transcript,
             safe,
             punishment,
             reason,
@@ -97,8 +93,8 @@ class EventLog:
         self._conn.execute(
             """INSERT INTO events
                (ts, msg_id, user_id, unique_id, nickname, raw_comment, normalized,
-                transcript, safe, punishment, reason, llm_raw, action_ok)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                safe, punishment, reason, llm_raw, action_ok)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 time.time(),
                 msg_id,
@@ -107,7 +103,6 @@ class EventLog:
                 nickname,
                 raw_comment,
                 normalized,
-                transcript,
                 1 if safe else 0,
                 punishment,
                 reason,
