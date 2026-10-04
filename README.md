@@ -94,6 +94,10 @@ FROM events ORDER BY ts DESC;
 
 ## Failure behavior
 
+- Unexpected pipeline runner exception: log the failure, drain pending messages,
+  close TTS, shut down the bridge, and close the event log; exit with status `1`.
+  Normal runner completion and handled SIGINT/SIGTERM shutdown exit with `0`.
+  A `KeyboardInterrupt` caught by `main()` exits with `130`.
 - Kokoro unavailable or its warmup fails: abort startup before connecting to
   TikTok; there is no fallback speech engine.
 - Kokoro fails on one comment, returns invalid samples, or produces more than 30

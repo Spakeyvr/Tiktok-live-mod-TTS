@@ -110,6 +110,7 @@ async def _amain(cfg_path: Path) -> int:
     runner: asyncio.Task | None = None
     waiter: asyncio.Task | None = None
     bridge_started = False
+    exit_code = 0
     try:
         # Fail before joining the live if weights/configuration are unavailable,
         # and absorb the one-time MLX compilation cost during startup.
@@ -131,6 +132,8 @@ async def _amain(cfg_path: Path) -> int:
                 pass
             except Exception:
                 log.exception("pipeline runner crashed")
+                # Finish cleanup, but report the fatal runner failure to the caller.
+                exit_code = 1
         if waiter is not None:
             waiter.cancel()
             try:
@@ -143,7 +146,7 @@ async def _amain(cfg_path: Path) -> int:
         if bridge_started:
             await bridge.shutdown()
         await event_log.close()
-    return 0
+    return exit_code
 
 
 def main() -> int:
